@@ -1,0 +1,29 @@
+# dependencies
+/node_modules
+
+# testing
+/coverage
+
+# production
+/dist
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+
+.vscode
+.idea
+
+.private
+
+# AI assistant files
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.cursor/
+.aider*
+.claude/
+*.ai.md
