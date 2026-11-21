@@ -16,6 +16,18 @@ describe('getWindow', () => {
     expect(result).toBeDefined();
   });
 
+  test('should throw a helpful error when no window and no Node.js module loader', () => {
+    const spy = vi
+      .spyOn(process, 'getBuiltinModule')
+      .mockReturnValue(undefined as never);
+
+    try {
+      expect(() => getWindow()).toThrow(/no DOM window available/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   test('should use globalThis.window when available (browser environment)', () => {
     const fakeWindow = new JSDOM('').window;
     const original = globalThis.window;
