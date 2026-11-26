@@ -141,6 +141,26 @@ npm run lint      # Lint
 npm run typecheck # Type check
 ```
 
+## Releasing
+
+Releases run on GitHub Actions. Nothing is built or published from a maintainer's machine, and there is no npm token anywhere: `scripts/release.mjs` only pushes a `release-<level>-<timestamp>` trigger tag, and [`.github/workflows/release.yml`](./.github/workflows/release.yml) does the rest.
+
+```bash
+npm run release          # Re-stage the current version (recovery)
+npm run release:patch    # 1.0.0 -> 1.0.1
+npm run release:minor    # 1.0.0 -> 1.1.0
+npm run release:major    # 1.0.0 -> 2.0.0
+```
+
+The trigger requires a clean working tree (untracked files included) and `HEAD == origin/main`, so the published code is always a commit that is already on `main`.
+
+The workflow runs in two jobs:
+
+1. **`build`** installs dependencies, builds, smoke-tests `dist` and uploads it. It holds no release credentials and does not persist its checkout credentials, because this is where dependency and build-tool code runs.
+2. **`release`** takes only that `dist` artifact, then bumps the version, packs the tarball, pushes the release commit and the `vX.Y.Z` tag atomically, and runs `npm stage publish`. It installs nothing — `scripts/publish.mjs` needs no `node_modules`.
+
+npm publishing uses [Trusted Publishing](https://docs.npmjs.com/trusted-publishers) (OIDC) configured **stage-only**, so a successful run ends with the version _staged_, not published. A maintainer approves it with 2FA — `npm stage list` then `npm stage approve <stage-id>`, or the Staged Packages tab on npmjs.com. Until then, `main` carrying a version the registry does not have is the expected state.
+
 ## License
 
 [MIT](./LICENSE)
