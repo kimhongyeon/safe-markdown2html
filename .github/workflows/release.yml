@@ -1,0 +1,246 @@
+name: Release
+
+# Started by `npm run release[:patch|:minor|:major]`, which pushes a trigger
+# tag. The npm Trusted Publisher for safe-markdown2html must reference this
+# workflow file name (release.yml).
+on:
+  push:
+    tags:
+      - 'release-*'
+
+concurrency:
+  group: release
+  # By default only one pending run is kept and a newer trigger silently
+  # cancels it. `queue: max` keeps every trigger queued instead.
+  queue: max
+  cancel-in-progress: false
+
+# The default for every job, and all `build` ever gets. `release` adds only
+# `id-token`; nothing here is ever granted write access to the repository,
+# because the release push uses a GitHub App token instead.
+permissions:
+  contents: read
+
+jobs:
+  # Dependency and build-tool code runs in this job and nowhere else, so this
+  # job holds no release credentials: no write access, no `id-token`, and the
+  # checkout credentials are not persisted. Deferring the credentials to a later
+  # step of a single job would not have been a boundary — every step of a job
+  # shares one machine and one user, so a background process left behind by
+  # `npm ci` or the build outlives the step that started it and can read a later
+  # step's environment or `.git/config`. Two jobs are two machines.
+  #
+  # What a compromised build can still do is corrupt `dist`. That reaches the
+  # registry only as a staged version a maintainer approves with 2FA, and never
+  # reaches a token that can push to `main`.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # Re-checked in `release`, which trusts nothing from this job. Here it
+      # only rejects a malformed tag before paying for an install and a build.
+      - name: Parse release level
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^release-(none|patch|minor|major)-[0-9]{14}$ ]]; then
+            echo "ERROR: Invalid release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+      # The trigger tag's own commit, which `release` separately requires to be
+      # the latest main.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The package's own support floor, and what CI tests on. The `release`
+      # job deliberately uses a newer Node; see the npm gate there.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # The smoke test loads the built files the way a consumer would, and it
+      # needs the runtime dependencies, so this job is the only place it can
+      # run against the exact artifact that will be published.
+      - name: Smoke test dist
+        run: npm run test:dist
+
+      # `dist` is the only thing that crosses into `release`, and it is used
+      # there for the npm tarball alone — never for a commit, since the release
+      # commit is produced by `release` from its own checkout and stages only
+      # `package.json` and `package-lock.json`. `release` deliberately takes no
+      # job output from here either: an output interpolated into a `run:` block
+      # would be a way back in.
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  # Holds the release credentials and runs no project dependency or build-tool
+  # code: no `npm ci`, no build. `scripts/publish.mjs` needs no `node_modules` —
+  # git, `npm version`, `npm pack` and `npm stage publish` only, and nothing is
+  # installed. npm itself is trusted here and has to be, since it is what talks
+  # to the registry.
+  #
+  # The release commit and version tag are pushed with a short-lived GitHub App
+  # token, not `GITHUB_TOKEN`: `main` requires a pull request, and
+  # `github-actions[bot]` cannot be granted a ruleset bypass — it does not
+  # appear in the bypass actor list at all, while an installed App does. So
+  # `GITHUB_TOKEN` stays read-only here.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing (OIDC)
+    steps:
+      - name: Parse release level
+        id: level
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^release-(none|patch|minor|major)-[0-9]{14}$ ]]; then
+            echo "ERROR: Invalid release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "level=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      # Node 24, not the 22 this package supports and CI tests on: staged
+      # publishing needs npm >= 11.15.0 and Node 22 tops out at npm 10.9.9, so
+      # 22 can never satisfy the gate below. No `cache: npm` — this job installs
+      # nothing, so the step does not need the repository and precedes checkout.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.x
+
+      # Staged publishing needs npm >= 11.15.0; Trusted Publishing alone needs
+      # only 11.5.1, so this gate is the higher of the two on purpose.
+      #
+      # It fails rather than upgrading. `npm install -g npm@latest` would fetch
+      # unpinned code into the job that holds the release credentials, and
+      # ordering it earlier would not have contained it: a process it leaves
+      # behind outlives its step and can read them afterwards, which is the same
+      # reasoning that put the build in a separate job. The `id-token`
+      # permission is job-wide and cannot be narrowed to a step either, so the
+      # containment has to be that no third-party code runs here at all.
+      #
+      # Node 24.x has bundled npm >= 11.16.0 since 24.18.0, so this never fires
+      # today. The gate runs before publish.mjs, so a failure here leaves `main`
+      # untouched and a new trigger tag retries cleanly.
+      - name: Ensure npm supports staged publishing
+        run: |
+          npm_version="$(npm -v)"
+          echo "npm $npm_version"
+          if ! node -e 'const [a,b]=process.argv[1].split(".").map(Number); process.exit(a>11||(a===11&&b>=15)?0:1)' "$npm_version"; then
+            echo "ERROR: npm $npm_version cannot stage a publish; >= 11.15.0 is required." >&2
+            echo "Pin this job's node-version to a release bundling npm >= 11.15.0." >&2
+            exit 1
+          fi
+
+      # Scoped to this repository: no `owner` or `repositories` input is passed,
+      # so the token covers only the repository the workflow runs in.
+      - name: Create release bot token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+
+      # Checked out with the App token, whose credentials publish.mjs uses to
+      # push. Full history so the Releases step can find the previous tag.
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Check tag points to latest main
+        run: |
+          tag_sha="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
+          main_sha="$(git rev-parse HEAD)"
+          if [ "$tag_sha" != "$main_sha" ]; then
+            echo "ERROR: Tag commit ($tag_sha) is not the latest main commit ($main_sha)." >&2
+            exit 1
+          fi
+
+      # After the checkout, which cleans the workspace. publish.mjs checks that
+      # the expected files actually arrived before it bumps anything.
+      - name: Download build output
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      # The bot's own identity, looked up so the commit is attributed to the App
+      # rather than to whoever triggered the release.
+      - name: Configure git identity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+      - name: Bump, pack and stage
+        run: node scripts/publish.mjs "${{ steps.level.outputs.level }}"
+
+      # The version tag is pushed by publish.mjs; this turns it into an entry on
+      # the repository's Releases page. It runs after a successful stage publish,
+      # so the entry appears before the npm version is approved — the tag and the
+      # code it points at are already on main at that moment.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          tag="v$(node -p "require('./package.json').version")"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving it unchanged." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Pin the notes baseline to the previous version tag rather than
+          # letting `--generate-notes` pick one. The baseline follows the commit
+          # history, not version ordering, so a stray higher tag elsewhere
+          # cannot become the starting point.
+          previous="$(git describe --tags --abbrev=0 --match 'v*' "$tag^" 2>/dev/null || true)"
+          args=(--title "$tag" --generate-notes --verify-tag)
+          if [ -n "$previous" ]; then
+            args+=(--notes-start-tag "$previous")
+            echo "Generating notes since $previous."
+          fi
+
+          # A missing Release entry does not undo a release: the commit, the tag
+          # and the staged npm version are all in place by now. Failing the job
+          # here would mark a finished release as failed, and the usual answer to
+          # that — re-triggering — bumps the version again, while level `none`
+          # cannot recover either because the version is already staged. So the
+          # gap is reported and the run is allowed to finish.
+          if gh release create "$tag" "${args[@]}"; then
+            echo "Created release $tag." >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### :warning: Release $tag has no Releases entry"
+              echo
+              echo "\`gh release create\` failed. Only the Releases entry is missing: the commit, the tag and the staged npm version are all in place, and the version still needs 2FA approval."
+              echo "Add the entry with:"
+              echo
+              echo "\`\`\`"
+              echo "gh release create $tag --title $tag --generate-notes --verify-tag${previous:+ --notes-start-tag $previous}"
+              echo "\`\`\`"
+              echo
+              echo "Or on the Releases page: Draft a new release, choose the existing tag \`$tag\`, then Generate release notes."
+              echo "Do not re-run this workflow or push another trigger tag: that would release a new version."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
